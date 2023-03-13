@@ -1,0 +1,263 @@
+---
+title: "R2BEAT workflow for Enumeration Areas as PSUs"
+author: "Giulio Barcaroli"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE, message=FALSE}
+knitr::opts_chunk$set(
+	echo = TRUE,
+	message = FALSE,
+	warning = FALSE
+)
+library(R2BEAT)
+library(ReGenesees)
+```
+
+## Problem definition
+
+In a two-stage sample design, when the Primary Sampling Units are characterized by a non-uniform distribution of the measure of size (for instance, number of dwellings or households), as in the case of Municipalities, the usual R2BEAT workflows described in
+
+https://barcaroli.github.io/R2BEAT/articles/R2BEAT_workflow.html
+
+https://barcaroli.github.io/R2BEAT/articles/R2BEAT_workflow_from_frame.html
+
+are not convenient. 
+
+In fact, the optimal allocation algorithm implemented in the function 'beat.2st' is based on an iterative procedure where at each iteration the threshold between self-representative and non self-representative can vary and hence also the best solution can vary, until convergence.
+
+If the distribution of the measure of size is approximately uniform, as in the case of the Census Enumeration Areas, that are defined by trying to balance the number of dwellings and households, assumin that a previous round of the survey is available, the methodological approach should be changed in this way:
+
+a) as usual, the input for the optimization step can be prepared by using the sample data of the previous round, in particular estimating for each sampling stratum and for each target variable, the mean and the standard deviation, together with the deff;
+
+b) the standard deviations are inflated by multiplying them by the values of the square root of the deff;
+
+c) given the precision constraints, the simple Bethel algorithm (implemented in the function 'beat.1st') is applied, obtaining the sample size and the allocations in the strata in terms of the Secondary Stage Units (SSUs);
+
+d) the SSUs figures are divided by the required number of SSUs to be selected in each PSU, to obtain the corresponding sample size and allocations expressed in terms of PSUs.
+
+Then, as usual it is possible to proceed to select the PSUs and the SSUs.
+
+In the following a complete example of the above workflow will be illustrated.
+
+## 1. Input data
+
+We consider here the availability of two different input data:
+
+1. a sampling frame (for instance, from a census) containing the whole set individuals included in teh population of interest, organized in SSUs (households) and in PSUs (Enumeration Areas);
+
+2. a dataset originated by a previous round of the survey object of the sample design.
+
+### 1.1 Sampling frame
+
+```{r}
+load("frame_pop_EA.RData")
+str(frame_pop_EA)
+```
+
+```{r}
+length(unique(frame_pop_EA$id_hh))
+```
+
+```{r}
+length(unique(frame_pop_EA$id_MUN_EA))
+```
+So, we have 2,217,700 individuals in 945,074 households and 8,239 Enumeration Areas.
+
+The EAs are well balanced in terms of the number of households:
+
+```{r}
+summary(frame_pop_EA$nfam_in_EA)
+```
+```{r}
+hist(frame_pop_EA$nfam_in_EA)
+```
+
+
+
+### 1.2 Sample dataset
+
+```{r}
+load("sample.RData")
+str(samp)
+```
+Using the ReGenesees function, we define the sample design:
+
+```{r message=FALSE, warning=FALSE}
+samp$stratum_2 <- as.factor(samp$stratum_2)
+sample.des <- e.svydesign(samp, 
+                          ids= ~ id_MUN_EA + id_hh, 
+                          strata = ~ stratum_2, 
+                          weights = ~ weight,
+                          self.rep.str = ~ SR,
+                          check.data = TRUE)
+```
+Find and collapse lonely strata:
+
+```{r}
+ls <- find.lon.strata(sample.des)
+if (!is.null(ls)) sample.des <- collapse.strata(sample.des)
+```
+and calibrate with known totals:
+
+```{r}
+totals <- pop.template(sample.des,
+                       calmodel = ~ sex : cl_age, 
+                       partition = ~ region)
+totals <- fill.template(frame_pop_EA, totals, mem.frac = 10)
+sample.cal <- e.calibrate(sample.des, 
+                          totals,
+                          calmodel = ~ sex : cl_age, 
+                          partition = ~ region,
+                          calfun = "logit",
+                          bounds = c(0.3, 2.6), 
+                          aggregate.stage = 2,
+                          force = FALSE)
+```
+## 2. Input preparation for allocation step
+
+```{r message=FALSE, warning=FALSE}
+samp_frame <- frame_pop_EA
+RGdes <- sample.des
+RGcal <- sample.cal
+strata_var <- c("stratum")      
+target_vars <- c("income_hh",
+                 "active",
+                 "inactive",
+                 "unemployed")   
+weight_var <- "weight"
+deff_var <- "stratum"            
+id_PSU <- c("id_MUN_EA")      
+id_SSU <- c("id_hh")             
+domain_var <- c("region") 
+delta <- length(unique(samp_frame$id_ind)) / length(unique(samp_frame$id_hh))                  
+minimum <- 24                
+
+inp <- prepareInputToAllocation2(
+  samp_frame,  # sampling frame
+  RGdes,       # ReGenesees design object
+  RGcal,       # ReGenesees calibrated object
+  id_PSU,      # identification variable of PSUs
+  id_SSU,      # identification variable of SSUs
+  strata_var,  # strata variables
+  target_vars, # target variables
+  deff_var,    # deff variables
+  domain_var,  # domain variables
+  delta,       # Average number of SSUs for each selection unit
+  minimum      # Minimum number of SSUs to be selected in each PSU
+)
+```
+
+## 3. Allocation step
+
+We consider the strata and the deff:
+
+```{r}
+strata <- inp$strata
+deff <- inp$deff
+```
+
+and inflate the standard deviations of the estimates in strata with the square root of the deff:
+
+```{r}
+strata2 <- strata
+strata2$S1 <- strata$S1 * sqrt(deff$DEFF1)
+strata2$S2 <- strata$S2 * sqrt(deff$DEFF2)
+strata2$S3 <- strata$S3 * sqrt(deff$DEFF3)
+strata2$S4 <- strata$S4 * sqrt(deff$DEFF4)
+```
+
+We set the precision constraints:
+
+```{r}
+cv <- as.data.frame(list(DOM=c("DOM1","DOM2"),
+                         CV1=c(0.02,0.03),
+                         CV2=c(0.03,0.06),
+                         CV3=c(0.03,0.06),
+                         CV4=c(0.05,0.08)))
+cv
+```
+We can now apply the Bethel algorithm:
+
+```{r}
+alloc <- beat.1st(stratif = strata2, errors = cv)
+sum(alloc$n)
+```
+which is higher with respect to the case with non-inflated standard deviations:
+
+```{r}
+alloc_no_deff <- beat.1st(stratif = strata, errors = cv)
+sum(alloc_no_deff$n)
+```
+These are the expected values of the CVs under this allocation (together with sensitivity):
+
+```{r}
+# source("sens_names.R")
+sens_names(s=alloc$sensitivity,
+           target_vars=target_vars,
+           strata=strata2)
+```
+
+## 4. Sample selection
+
+### 4.1 Selection of the Enumeration Areas
+
+In order to determine the allocation of the PSUs on the basis of the allocation of SSUs, we first refine the definition of the DELTA (average number of indivuals per household), by calculating its values differentiated in each stratum:
+
+```{r}
+des_file <- inp$des_file 
+des_file$DELTA <- with(samp_frame, tapply(id_ind, list(stratum), function(x) length(unique(x)))) / 
+  with(samp_frame, tapply(id_hh, list(stratum), function(x) length(unique(x))))
+des_file
+```
+We can now proceed to select the sample of PSUs:
+
+```{r}
+# source("select_PSU2.R")
+psu_file <- inp$psu_file
+PSU_sample <- select_PSU2(alloc=alloc, 
+                    type="ALLOC", 
+                    des_file=des_file,
+                    psu_file=psu_file)
+```
+This are the results:
+
+```{r}
+head(PSU_sample$sample_PSUs,20)
+```
+It is interesting to notice that the sample in each stratum is self-weighted (weights have equal weights).
+
+```{r}
+PSU_sample$PSU_stats
+```
+The sum of the inverse of the probabilities of inclusion of the first stage almost reproduce the true value in the frame (8,239):
+
+```{r}
+sum(1/PSU_sample$sample_PSUs$pik_1st)
+```
+### 4.2 Selection of the households
+
+Finally, we can select the sample of households:
+
+```{r}
+# source("select_SSU.R")
+PSU_sample$sample_PSUs$Pik <- PSU_sample$sample_PSUs$pik_1st
+samp <- select_SSU(df=samp_frame,
+                   PSU_code="id_MUN_EA",
+                   SSU_code="id_hh",
+                   PSU_sampled=PSU_sample$sample_PSU,
+                   verbose=FALSE)
+```
+
+
+```{r}
+head(samp)
+```
+
+The sum of the weights perfectly eqaulizes the number of individuals in the sampling frame (2,217,700):
+
+```{r}
+sum(samp$weight)
+```
+
